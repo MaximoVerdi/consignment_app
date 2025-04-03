@@ -73,10 +73,10 @@ class User {
     }
   }
 
-  static async updateUserProfile(userId, firstName, lastName) {
+  static async updateUserProfile(userId, first_name, last_name) {
     await db.execute(
       "UPDATE users SET first_name = ?, last_name = ? WHERE user_id = ?",
-      [firstName, lastName, userId]
+      [first_name, last_name, userId]
     );
   }
 

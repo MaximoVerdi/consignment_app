@@ -7,20 +7,26 @@ const helmet = require("helmet");
 const hpp = require("hpp");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
-const User = require("./models/userModel");
 const jwt = require("jsonwebtoken");
 const verifyToken = require("./middleware/authMiddleware");
+const authController = require("./controllers/authController");
 
-dotenv.config();
+const {
+  mainPool,
+  getTenantPool,
+  createTenantDatabase,
+} = require("./config/db");
+
+dotenv.config({ path: ".env" });
 const app = express();
 
 // ======================
 // 1. Middlewares Básicos
 // ======================
-app.use(helmet());
-app.use(hpp());
 app.use(express.json({ limit: "10kb" }));
 app.use(express.urlencoded({ extended: true, limit: "10kb" }));
+app.use(helmet());
+app.use(hpp());
 app.use(cors());
 
 // ======================
@@ -34,81 +40,39 @@ const limiter = rateLimit({
 app.use("/api/", limiter);
 
 // ======================
-// 3. Conexión a la DB
-// ======================
-const db = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASS,
-  database: process.env.DB_NAME,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-});
-
-// ======================
-// 4. Endpoints
+// 3. Endpoints
 // ======================
 
-// Endopoint de signup
-app.post("/api/auth/signup", async (req, res) => {
+// Auth (multi-tenant)
+app.post("/api/auth/signup", authController.register);
+app.post("/api/auth/login", authController.login);
+
+// Endpoint para crear nuevos tenants (locales)
+app.post("/api/tenants", verifyToken, async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const { tenantId } = req.body;
 
-    if (!username || !password) {
-      return res.status(400).json({ message: "Faltan datos" });
+    if (!tenantId || typeof tenantId !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "Se requiere un ID de tenant válido",
+      });
     }
 
-    // Encriptar la contraseña
-    const hashedPassword = await bcrypt.hash(password, 10);
+    await createTenantDatabase(tenantId);
 
-    // Guardar usuario en la base de datos
-    const newUser = await db.query(
-      "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-      [username, hashedPassword]
-    );
-
-    res.status(201).json({ message: "Usuario creado correctamente" });
-  } catch (error) {
-    console.error("❌ Error en signup:", error);
-    res.status(500).json({ message: "Error creando usuario" });
-  }
-});
-
-// Endpoint de login
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    console.log("Intentando login con:", username);
-
-    const user = await User.findByUsername(username);
-    console.log("Usuario encontrado:", user);
-
-    if (!user) {
-      return res.status(401).json({ message: "Invalid username" });
-    }
-
-    // Comparar contraseñas
-    const isMatch = await bcrypt.compare(password, user.password_hash);
-    if (!isMatch) {
-      return res.status(401).json({ message: "Invalid credentials" });
-    }
-
-    // Generar token JWT
-    const token = jwt.sign(
-      { user_id: user.user_id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    console.log("Login exitoso, enviando token y datos...");
     res.json({
-      token,
-      user_id: user.user_id,
-      username: user.username,
+      success: true,
+      message: `Local ${tenantId} creado exitosamente`,
+      databaseName: `consignment_${tenantId}`,
     });
   } catch (error) {
-    console.error("Error en login:", error);
+    console.error("Error creando tenant:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      code: error.code,
+    });
   }
 });
 
@@ -118,27 +82,27 @@ app.put("/api/update-user", verifyToken, async (req, res) => {
       email,
       phone,
       password,
-      firstName,
-      lastName,
+      first_name,
+      last_name,
       address,
       city,
       state,
-      postcode,
+      postal_code,
       country,
+      user_id,
     } = req.body;
 
-    const userId = req.user.userId;
+    const tenantId = req.user.tenant_id || "default";
+    const db = await getTenantPool(tenantId);
 
-    if (!userId) {
-      return res.status(400).json({
-        success: false,
-        message: "ID de usuario no identificado",
-      });
+    if (!db) {
+      throw new Error("Database connection not available");
     }
 
     const updates = [];
     const params = [];
 
+    // Actualizar datos básicos del usuario
     if (email) {
       updates.push("email = ?");
       params.push(email);
@@ -152,78 +116,63 @@ app.put("/api/update-user", verifyToken, async (req, res) => {
       updates.push("password_hash = ?");
       params.push(hashedPassword);
     }
-    if (firstName) {
+    if (first_name) {
       updates.push("first_name = ?");
-      params.push(firstName);
+      params.push(first_name);
     }
-    if (lastName) {
+    if (last_name) {
       updates.push("last_name = ?");
-      params.push(lastName);
+      params.push(last_name);
     }
 
     if (updates.length > 0) {
-      params.push(userId);
-      await db.execute(
+      params.push(user_id);
+      await db.query(
         `UPDATE users SET ${updates.join(", ")} WHERE user_id = ?`,
         params
       );
     }
 
-    if (address || city || state || postcode || country) {
+    // Actualizar dirección
+    if (address || city || state || postal_code || country) {
       try {
-        console.log("Intentando actualizar dirección con:", {
-          userId,
-          address,
-          city,
-          state,
-          postcode,
-          country,
-        });
-
-        // Verificar si existe dirección
-        const [existingAddress] = await db.execute(
+        const [existingAddress] = await db.query(
           "SELECT address_id FROM user_addresses WHERE user_id = ?",
-          [userId]
+          [user_id]
         );
 
-        console.log("Dirección existente:", existingAddress);
-
-        if (existingAddress && existingAddress.length > 0) {
-          // Actualizar dirección existente
-          const updateResult = await db.execute(
+        if (existingAddress?.length > 0) {
+          await db.query(
             `UPDATE user_addresses SET 
-          address = COALESCE(?, address), 
-          city = COALESCE(?, city), 
-          state = COALESCE(?, state), 
-          postal_code = COALESCE(?, postal_code), 
-          country = COALESCE(?, country) 
-         WHERE user_id = ?`,
+              address = COALESCE(?, address), 
+              city = COALESCE(?, city), 
+              state = COALESCE(?, state), 
+              postal_code = COALESCE(?, postal_code), 
+              country = COALESCE(?, country) 
+              WHERE user_id = ?`,
             [
               address || null,
               city || null,
               state || null,
-              postcode || null,
+              postal_code || null,
               country || null,
-              userId,
+              user_id,
             ]
           );
-          console.log("Resultado de actualización:", updateResult);
         } else {
-          // Insertar nueva dirección
-          const insertResult = await db.execute(
+          await db.query(
             `INSERT INTO user_addresses 
-          (user_id, address, city, state, postal_code, country) 
-         VALUES (?, ?, ?, ?, ?, ?)`,
+              (user_id, address, city, state, postal_code, country) 
+              VALUES (?, ?, ?, ?, ?, ?)`,
             [
-              userId,
+              user_id,
               address || "",
               city || "",
               state || "",
-              postcode || "",
+              postal_code || "",
               country || "",
             ]
           );
-          console.log("Resultado de inserción:", insertResult);
         }
       } catch (error) {
         console.error("Error al procesar dirección:", error);
@@ -239,57 +188,144 @@ app.put("/api/update-user", verifyToken, async (req, res) => {
     console.error("Error actualizando usuario:", error);
     res.status(500).json({
       success: false,
-      message: "Error en el servidor al actualizar datos",
+      message: error.message,
+      code: error.code,
     });
   }
 });
 
-// Endpoint de prueba para verificar el middleware
+// Endpoint para verificar autenticación
 app.get("/api/check-auth", verifyToken, (req, res) => {
   res.json({
     success: true,
-    message: "Authentication successful",
-    user: req.user,
+    user: {
+      ...req.user,
+      tenant_id: req.user.tenant_id || "default",
+    },
   });
 });
 
-// Endpoint de perfil
+// Endpoint para obtener perfil de usuario
 app.get("/api/profile/:userId", verifyToken, async (req, res) => {
   try {
     const userId = parseInt(req.params.userId);
+    const tenantId = req.user.tenant_id || "default";
 
     if (!Number.isInteger(userId)) {
-      return res.status(400).json({ error: "Invalid user ID" });
+      return res.status(400).json({
+        success: false,
+        message: "ID de usuario inválido",
+        code: "INVALID_USER_ID",
+      });
     }
 
-    // Obtener datos básicos del usuario
-    const [userRows] = await db.query(
-      "SELECT user_id, username, email, phone, first_name, last_name, role, created_at FROM users WHERE user_id = ?",
+    const db = await getTenantPool(tenantId);
+
+    // Consulta unificada con LEFT JOIN para evitar múltiples queries
+    const [results] = await db.query(
+      `SELECT 
+        u.user_id as userId,
+        u.username,
+        u.email,
+        u.phone,
+        u.first_name,
+        u.last_name,
+        u.role,
+        a.address,
+        a.city,
+        a.state,
+        a.postal_code as postal_code,
+        a.country
+      FROM users u
+      LEFT JOIN user_addresses a ON u.user_id = a.user_id
+      WHERE u.user_id = ?`,
       [userId]
     );
 
-    if (userRows.length === 0) {
-      return res.status(404).json({ error: "User not found" });
+    if (results.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Usuario no encontrado",
+        code: "USER_NOT_FOUND",
+      });
     }
-
-    // Obtener dirección del usuario
-    const [addressRows] = await db.query(
-      "SELECT address, city, state, postal_code, country FROM user_addresses WHERE user_id = ?",
-      [userId]
-    );
-
-    const responseData = {
-      ...userRows[0],
-      ...(addressRows.length > 0 ? addressRows[0] : {}),
-    };
 
     res.json({
       success: true,
-      data: responseData,
+      data: {
+        ...results[0],
+        address: results[0].address || "",
+        city: results[0].city || "",
+        state: results[0].state || "",
+        postal_code: results[0].postal_code || "",
+        country: results[0].country || "",
+      },
     });
   } catch (error) {
-    console.error("Database error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("Error en /api/profile:", error);
+
+    if (error.code === "ER_BAD_DB_ERROR") {
+      return res.status(500).json({
+        success: false,
+        message: "Base de datos del local no encontrada",
+        code: "TENANT_DB_NOT_FOUND",
+        solution: "Contacte al administrador",
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: "Error interno del servidor",
+      code: "INTERNAL_SERVER_ERROR",
+    });
+  }
+});
+
+// Endpoint para productos
+app.get("/api/products", verifyToken, async (req, res) => {
+  try {
+    const tenantId = req.user.tenant_id || "default";
+    const db = await getTenantPool(tenantId);
+
+    const [products] = await db.query(
+      "SELECT * FROM products WHERE tenant_id = ?",
+      [tenantId]
+    );
+
+    res.json({
+      success: true,
+      data: products,
+    });
+  } catch (error) {
+    console.error("Error obteniendo productos:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
+// Endpoint para consignatarios
+app.get("/api/consignors", verifyToken, async (req, res) => {
+  try {
+    const tenantId = req.user.tenant_id || "default";
+    const db = await getTenantPool(tenantId);
+
+    const [consignors] = await db.query(
+      "SELECT * FROM consignors WHERE tenant_id = ?",
+      [tenantId]
+    );
+
+    res.json({
+      success: true,
+      data: consignors,
+    });
+  } catch (error) {
+    console.error("Error obteniendo consignatarios:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
   }
 });
 
@@ -297,8 +333,8 @@ app.get("/api/profile/:userId", verifyToken, async (req, res) => {
 // 5. Manejo de Errores
 // ======================
 app.use((err, req, res, next) => {
-  console.error("Server error:", err);
-  res.status(500).json({ error: "Internal server error" });
+  console.error(err.stack);
+  res.status(500).json({ error: "Error interno del servidor" });
 });
 
 // ======================
@@ -307,4 +343,7 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Base de datos principal: consignment_db`);
 });
+
+module.exports = app; // Para testing
